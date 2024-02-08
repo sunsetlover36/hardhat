@@ -4,10 +4,12 @@ mod gas;
 mod inspector;
 
 use std::{
+    borrow::Cow,
     cmp,
     cmp::Ordering,
     collections::BTreeMap,
     fmt::Debug,
+    num::NonZeroUsize,
     sync::Arc,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
@@ -50,6 +52,7 @@ use gas::gas_used_ratio;
 use indexmap::IndexMap;
 use itertools::izip;
 use lazy_static::lazy_static;
+use lru::LruCache;
 use tokio::runtime;
 
 use self::{
@@ -73,6 +76,7 @@ use crate::{
 };
 
 const DEFAULT_INITIAL_BASE_FEE_PER_GAS: u64 = 1_000_000_000;
+const MAX_CACHED_BLOCK_CONTEXTS: usize = 1000;
 
 /// The result of executing an `eth_call`.
 #[derive(Clone)]
@@ -110,11 +114,6 @@ pub enum CreationError {
     RpcClient(#[from] RpcClientError),
 }
 
-struct BlockContext {
-    pub block: Arc<dyn SyncBlock<Error = BlockchainError>>,
-    pub state: Box<dyn SyncState<StateError>>,
-}
-
 pub struct ProviderData<LoggerErrorT: Debug> {
     runtime_handle: runtime::Handle,
     initial_config: ProviderConfig,
@@ -146,6 +145,7 @@ pub struct ProviderData<LoggerErrorT: Debug> {
     logger: Box<dyn SyncLogger<BlockchainError = BlockchainError, LoggerError = LoggerErrorT>>,
     impersonated_accounts: HashSet<Address>,
     subscriber_callback: Box<dyn SyncSubscriberCallback>,
+    block_state_cache: LruCache<u64, Box<dyn SyncState<StateError>>>,
 }
 
 impl<LoggerErrorT: Debug> ProviderData<LoggerErrorT> {
@@ -170,6 +170,12 @@ impl<LoggerErrorT: Debug> ProviderData<LoggerErrorT> {
             block_time_offset_seconds,
             next_block_base_fee_per_gas,
         } = create_blockchain_and_state(runtime_handle.clone(), &config, genesis_accounts)?;
+
+        let mut block_state_cache = LruCache::new(
+            NonZeroUsize::new(MAX_CACHED_BLOCK_CONTEXTS).expect("constant is non-zero"),
+        );
+
+        block_state_cache.push(blockchain.last_block_number(), state.clone());
 
         let allow_blocks_with_same_timestamp = config.allow_blocks_with_same_timestamp;
         let allow_unlimited_contract_size = config.allow_unlimited_contract_size;
@@ -212,6 +218,7 @@ impl<LoggerErrorT: Debug> ProviderData<LoggerErrorT> {
             logger,
             impersonated_accounts: HashSet::new(),
             subscriber_callback,
+            block_state_cache,
         })
     }
 
@@ -251,7 +258,7 @@ impl<LoggerErrorT: Debug> ProviderData<LoggerErrorT> {
     }
 
     pub fn balance(
-        &self,
+        &mut self,
         address: Address,
         block_spec: Option<&BlockSpec>,
     ) -> Result<U256, ProviderError<LoggerErrorT>> {
@@ -476,7 +483,7 @@ impl<LoggerErrorT: Debug> ProviderData<LoggerErrorT> {
 
     #[tracing::instrument(level = "trace", skip(self))]
     pub fn debug_trace_transaction(
-        &self,
+        &mut self,
         transaction_hash: &B256,
         trace_config: DebugTraceConfig,
     ) -> Result<DebugTraceResult, ProviderError<LoggerErrorT>> {
@@ -531,7 +538,7 @@ impl<LoggerErrorT: Debug> ProviderData<LoggerErrorT> {
     }
 
     pub fn debug_trace_call(
-        &self,
+        &mut self,
         transaction: ExecutableTransaction,
         block_spec: Option<&BlockSpec>,
         trace_config: DebugTraceConfig,
@@ -546,7 +553,7 @@ impl<LoggerErrorT: Debug> ProviderData<LoggerErrorT> {
             let result = run_call(RunCallArgs {
                 blockchain,
                 header: block.header(),
-                state: &state,
+                state,
                 state_overrides: &StateOverrides::default(),
                 cfg_env: cfg_env.clone(),
                 tx_env: tx_env.clone(),
@@ -559,7 +566,7 @@ impl<LoggerErrorT: Debug> ProviderData<LoggerErrorT> {
 
     /// Estimate the gas cost of a transaction. Matches Hardhat behavior.
     pub fn estimate_gas(
-        &self,
+        &mut self,
         transaction: ExecutableTransaction,
         block_spec: &BlockSpec,
     ) -> Result<u64, ProviderError<LoggerErrorT>> {
@@ -584,7 +591,7 @@ impl<LoggerErrorT: Debug> ProviderData<LoggerErrorT> {
             let result = call::run_call(RunCallArgs {
                 blockchain,
                 header,
-                state: &state,
+                state,
                 state_overrides: &state_overrides,
                 cfg_env: cfg_env.clone(),
                 tx_env: tx_env.clone(),
@@ -620,7 +627,7 @@ impl<LoggerErrorT: Debug> ProviderData<LoggerErrorT> {
             let result = gas::check_gas_limit(CheckGasLimitArgs {
                 blockchain,
                 header,
-                state: &state,
+                state,
                 state_overrides: &state_overrides,
                 cfg_env: cfg_env.clone(),
                 tx_env: tx_env.clone(),
@@ -639,7 +646,7 @@ impl<LoggerErrorT: Debug> ProviderData<LoggerErrorT> {
             let estimation = gas::binary_search_estimation(BinarySearchEstimationArgs {
                 blockchain,
                 header,
-                state: &state,
+                state,
                 state_overrides: &state_overrides,
                 cfg_env: cfg_env.clone(),
                 tx_env: tx_env.clone(),
@@ -820,7 +827,7 @@ impl<LoggerErrorT: Debug> ProviderData<LoggerErrorT> {
     }
 
     pub fn get_code(
-        &self,
+        &mut self,
         address: Address,
         block_spec: Option<&BlockSpec>,
     ) -> Result<Bytes, ProviderError<LoggerErrorT>> {
@@ -865,7 +872,7 @@ impl<LoggerErrorT: Debug> ProviderData<LoggerErrorT> {
     }
 
     pub fn get_storage_at(
-        &self,
+        &mut self,
         address: Address,
         index: U256,
         block_spec: Option<&BlockSpec>,
@@ -877,7 +884,7 @@ impl<LoggerErrorT: Debug> ProviderData<LoggerErrorT> {
     }
 
     pub fn get_transaction_count(
-        &self,
+        &mut self,
         address: Address,
         block_spec: Option<&BlockSpec>,
     ) -> Result<u64, ProviderError<LoggerErrorT>> {
@@ -941,6 +948,7 @@ impl<LoggerErrorT: Debug> ProviderData<LoggerErrorT> {
 
         let snapshot = Snapshot {
             block_number: self.blockchain.last_block_number(),
+            block_state_cache: self.block_state_cache.clone(),
             block_time_offset_seconds: self.block_time_offset_seconds,
             coinbase: self.beneficiary,
             irregular_state: self.irregular_state.clone(),
@@ -1027,16 +1035,16 @@ impl<LoggerErrorT: Debug> ProviderData<LoggerErrorT> {
         // Remove outdated filters
         self.filters.retain(|_, filter| !filter.has_expired());
 
+        self.block_state_cache
+            .push(block.header().number, result.state.clone());
         self.state = result.state;
 
-        let result = DebugMineBlockResult {
+        Ok(DebugMineBlockResult {
             block: block_and_total_difficulty.block,
             transaction_results: result.transaction_results,
             transaction_traces: result.transaction_traces,
             console_log_inputs: result.console_log_inputs,
-        };
-
-        Ok(result)
+        })
     }
 
     /// Mines `number_of_blocks` blocks with the provided `interval` between
@@ -1157,7 +1165,7 @@ impl<LoggerErrorT: Debug> ProviderData<LoggerErrorT> {
     }
 
     pub fn nonce(
-        &self,
+        &mut self,
         address: &Address,
         block_spec: Option<&BlockSpec>,
         state_overrides: &StateOverrides,
@@ -1215,6 +1223,7 @@ impl<LoggerErrorT: Debug> ProviderData<LoggerErrorT> {
         if let Some(snapshot) = removed_snapshots.remove(&snapshot_id) {
             let Snapshot {
                 block_number,
+                block_state_cache,
                 block_time_offset_seconds,
                 coinbase,
                 irregular_state,
@@ -1225,6 +1234,8 @@ impl<LoggerErrorT: Debug> ProviderData<LoggerErrorT> {
                 state,
                 time,
             } = snapshot;
+
+            self.block_state_cache = block_state_cache;
 
             // We compute a new offset such that:
             // now + new_offset == snapshot_date + old_offset
@@ -1251,7 +1262,7 @@ impl<LoggerErrorT: Debug> ProviderData<LoggerErrorT> {
     }
 
     pub fn run_call(
-        &self,
+        &mut self,
         transaction: ExecutableTransaction,
         block_spec: Option<&BlockSpec>,
         state_overrides: &StateOverrides,
@@ -1266,7 +1277,7 @@ impl<LoggerErrorT: Debug> ProviderData<LoggerErrorT> {
             let execution_result = call::run_call(RunCallArgs {
                 blockchain,
                 header: block.header(),
-                state: &state,
+                state,
                 state_overrides,
                 cfg_env,
                 tx_env,
@@ -1392,7 +1403,8 @@ impl<LoggerErrorT: Debug> ProviderData<LoggerErrorT> {
         address: Address,
         balance: U256,
     ) -> Result<(), ProviderError<LoggerErrorT>> {
-        let account_info = self.state.modify_account(
+        let mut state = self.state.clone();
+        let account_info = state.modify_account(
             address,
             AccountModifierFn::new(Box::new(move |account_balance, _, _| {
                 *account_balance = balance;
@@ -1407,16 +1419,19 @@ impl<LoggerErrorT: Debug> ProviderData<LoggerErrorT> {
             },
         )?;
 
-        let block_number = self.blockchain.last_block_number();
-        let state_root = self.state.state_root()?;
+        let state_root = state.state_root()?;
 
+        self.mem_pool.update(&state)?;
+
+        let block_number = self.blockchain.last_block_number();
         self.irregular_state
             .state_override_at_block_number(block_number)
             .or_insert_with(|| StateOverride::with_state_root(state_root))
             .diff
             .apply_account_change(address, account_info.clone());
 
-        self.mem_pool.update(&self.state)?;
+        self.block_state_cache.push(block_number, state.clone());
+        self.state = state;
 
         Ok(())
     }
@@ -1440,7 +1455,8 @@ impl<LoggerErrorT: Debug> ProviderData<LoggerErrorT> {
         let default_code = code.clone();
         let irregular_code = code.clone();
 
-        let mut account_info = self.state.modify_account(
+        let mut state = self.state.clone();
+        let mut account_info = state.modify_account(
             address,
             AccountModifierFn::new(Box::new(move |_, _, account_code| {
                 *account_code = Some(code.clone());
@@ -1459,14 +1475,17 @@ impl<LoggerErrorT: Debug> ProviderData<LoggerErrorT> {
         // irregular state.
         account_info.code = Some(irregular_code.clone());
 
-        let block_number = self.blockchain.last_block_number();
-        let state_root = self.state.state_root()?;
+        let state_root = state.state_root()?;
 
+        let block_number = self.blockchain.last_block_number();
         self.irregular_state
             .state_override_at_block_number(block_number)
             .or_insert_with(|| StateOverride::with_state_root(state_root))
             .diff
             .apply_account_change(address, account_info.clone());
+
+        self.block_state_cache.push(block_number, state.clone());
+        self.state = state;
 
         Ok(())
     }
@@ -1550,7 +1569,8 @@ impl<LoggerErrorT: Debug> ProviderData<LoggerErrorT> {
             });
         }
 
-        let account_info = self.state.modify_account(
+        let mut state = self.state.clone();
+        let account_info = state.modify_account(
             address,
             AccountModifierFn::new(Box::new(move |_, account_nonce, _| *account_nonce = nonce)),
             &|| {
@@ -1563,16 +1583,19 @@ impl<LoggerErrorT: Debug> ProviderData<LoggerErrorT> {
             },
         )?;
 
-        let block_number = self.blockchain.last_block_number();
-        let state_root = self.state.state_root()?;
+        let state_root = state.state_root()?;
 
+        self.mem_pool.update(&state)?;
+
+        let block_number = self.blockchain.last_block_number();
         self.irregular_state
             .state_override_at_block_number(block_number)
             .or_insert_with(|| StateOverride::with_state_root(state_root))
             .diff
             .apply_account_change(address, account_info.clone());
 
-        self.mem_pool.update(&self.state)?;
+        self.block_state_cache.push(block_number, state.clone());
+        self.state = state;
 
         Ok(())
     }
@@ -1583,30 +1606,34 @@ impl<LoggerErrorT: Debug> ProviderData<LoggerErrorT> {
         index: U256,
         value: U256,
     ) -> Result<(), ProviderError<LoggerErrorT>> {
-        self.state.set_account_storage_slot(address, index, value)?;
+        let mut state = self.state.clone();
+        state.set_account_storage_slot(address, index, value)?;
 
-        let old_value = self.state.set_account_storage_slot(address, index, value)?;
+        let old_value = state.set_account_storage_slot(address, index, value)?;
 
         let slot = StorageSlot::new_changed(old_value, value);
-        let account_info = self.state.basic(address).and_then(|mut account_info| {
+        let account_info = state.basic(address).and_then(|mut account_info| {
             // Retrieve the code if it's not empty. This is needed for the irregular state.
             if let Some(account_info) = &mut account_info {
                 if account_info.code_hash != KECCAK_EMPTY {
-                    account_info.code = Some(self.state.code_by_hash(account_info.code_hash)?);
+                    account_info.code = Some(state.code_by_hash(account_info.code_hash)?);
                 }
             }
 
             Ok(account_info)
         })?;
 
-        let block_number = self.blockchain.last_block_number();
-        let state_root = self.state.state_root()?;
+        let state_root = state.state_root()?;
 
+        let block_number = self.blockchain.last_block_number();
         self.irregular_state
             .state_override_at_block_number(block_number)
             .or_insert_with(|| StateOverride::with_state_root(state_root))
             .diff
             .apply_storage_change(address, index, slot, account_info);
+
+        self.block_state_cache.push(block_number, state.clone());
+        self.state = state;
 
         Ok(())
     }
@@ -1752,17 +1779,45 @@ impl<LoggerErrorT: Debug> ProviderData<LoggerErrorT> {
     }
 
     fn execute_in_block_context<T>(
-        &self,
+        &mut self,
         block_spec: Option<&BlockSpec>,
         function: impl FnOnce(
             &dyn SyncBlockchain<BlockchainError, StateError>,
-            Arc<dyn SyncBlock<Error = BlockchainError>>,
-            Box<dyn SyncState<StateError>>,
+            &Arc<dyn SyncBlock<Error = BlockchainError>>,
+            &Box<dyn SyncState<StateError>>,
         ) -> T,
     ) -> Result<T, ProviderError<LoggerErrorT>> {
-        let (context, blockchain) = if let Some(context) = self.context_by_block_spec(block_spec)? {
-            (context, None)
+        let block = if let Some(block_spec) = block_spec {
+            self.block_by_block_spec(block_spec)?
         } else {
+            Some(self.blockchain.last_block()?)
+        };
+
+        if let Some(block) = block {
+            let block_header = block.header();
+            let block_number = block_header.number;
+
+            let contextual_state = if self.block_state_cache.contains(&block_number) {
+                // We cannot use `LruCache::try_get_or_insert`, because it needs &mut self, but
+                // we would need &self in the callback to reference the blockchain.
+                Cow::Borrowed(
+                    self.block_state_cache
+                        .get(&block_number)
+                        .expect("We checked that the state is in the cache"),
+                )
+            } else {
+                let state = self
+                    .blockchain
+                    .state_at_block_number(block_number, self.irregular_state.state_overrides())?;
+
+                self.block_state_cache.push(block_number, state.clone());
+
+                Cow::Owned(state)
+            };
+
+            Ok(function(&*self.blockchain, &block, &contextual_state))
+        } else {
+            // Block spec is pending
             let result = self.mine_pending_block()?;
 
             let blockchain =
@@ -1772,22 +1827,8 @@ impl<LoggerErrorT: Debug> ProviderData<LoggerErrorT> {
                 .last_block()
                 .expect("The pending block is the last block");
 
-            let context = BlockContext {
-                block,
-                state: result.state,
-            };
-
-            (context, Some(blockchain))
-        };
-
-        let blockchain = blockchain
-            .as_ref()
-            .map_or(&*self.blockchain, |blockchain| blockchain);
-
-        // Execute function in the requested block context.
-        let result = function(blockchain, context.block, context.state);
-
-        Ok(result)
+            Ok(function(&blockchain, &block, &result.state))
+        }
     }
 
     /// Mine a block at a specific timestamp
@@ -1923,33 +1964,6 @@ impl<LoggerErrorT: Debug> ProviderData<LoggerErrorT> {
                 signed_transaction,
             )?)
         }
-    }
-
-    fn context_by_block_spec(
-        &self,
-        block_spec: Option<&BlockSpec>,
-    ) -> Result<Option<BlockContext>, ProviderError<LoggerErrorT>> {
-        let block = if let Some(block_spec) = block_spec {
-            if let Some(block) = self.block_by_block_spec(block_spec)? {
-                block
-            } else {
-                // Block spec is pending
-                return Ok(None);
-            }
-        } else {
-            self.blockchain.last_block()?
-        };
-
-        let block_header = block.header();
-
-        let contextual_state = self
-            .blockchain
-            .state_at_block_number(block_header.number, self.irregular_state.state_overrides())?;
-
-        Ok(Some(BlockContext {
-            block,
-            state: contextual_state,
-        }))
     }
 
     fn validate_auto_mine_transaction(
@@ -2388,7 +2402,7 @@ mod tests {
 
     #[test]
     fn test_local_account_balance() -> anyhow::Result<()> {
-        let fixture = ProviderTestFixture::new()?;
+        let mut fixture = ProviderTestFixture::new()?;
 
         let account = *fixture
             .provider_data
@@ -2409,7 +2423,7 @@ mod tests {
 
     #[test]
     fn test_local_account_balance_forked() -> anyhow::Result<()> {
-        let fixture = ProviderTestFixture::new_forked()?;
+        let mut fixture = ProviderTestFixture::new_forked()?;
 
         let account = *fixture
             .provider_data
@@ -2552,6 +2566,27 @@ mod tests {
         let block = fixture.provider_data.block_by_block_spec(&block_spec)?;
 
         assert!(block.is_none());
+
+        Ok(())
+    }
+
+    // Make sure executing a transaction in a pending block context doesn't panic.
+    #[test]
+    fn execute_in_block_context_pending() -> anyhow::Result<()> {
+        let mut fixture = ProviderTestFixture::new()?;
+
+        let block_spec = Some(BlockSpec::Tag(BlockTag::Pending));
+
+        let mut value = 0;
+        let _ =
+            fixture
+                .provider_data
+                .execute_in_block_context(block_spec.as_ref(), |_, _, _| {
+                    value += 1;
+                    Ok::<(), ProviderError<Infallible>>(())
+                })?;
+
+        assert_eq!(value, 1);
 
         Ok(())
     }
