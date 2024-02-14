@@ -163,20 +163,22 @@ fn create_dummy_transaction() -> SignedTransaction {
 
 #[tokio::test(flavor = "multi_thread")]
 #[serial]
-async fn get_last_block() {
+async fn get_last_block() -> anyhow::Result<()> {
     let blockchains = create_dummy_blockchains().await;
 
     for mut blockchain in blockchains {
-        let next_block = create_dummy_block(blockchain.as_ref());
-        let expected = blockchain
-            .insert_block(next_block, StateDiff::default())
-            .expect("Failed to insert block");
+        let last_block_number = blockchain.last_block_number();
 
-        assert_eq!(
-            blockchain.last_block().unwrap().hash(),
-            expected.block.hash()
-        );
+        let last_block = blockchain.last_block()?;
+        assert_eq!(last_block.header().number, last_block_number);
+
+        let next_block = create_dummy_block(blockchain.as_ref());
+        let expected = blockchain.insert_block(next_block, StateDiff::default())?;
+
+        assert_eq!(blockchain.last_block()?.hash(), expected.block.hash());
     }
+
+    Ok(())
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -249,33 +251,30 @@ async fn get_block_by_number_none() {
 
 #[tokio::test(flavor = "multi_thread")]
 #[serial]
-async fn insert_block_multiple() {
+async fn insert_block_multiple() -> anyhow::Result<()> {
     let blockchains = create_dummy_blockchains().await;
 
     for mut blockchain in blockchains {
         let one = create_dummy_block(blockchain.as_ref());
-        let one = blockchain.insert_block(one, StateDiff::default()).unwrap();
+        let one = blockchain.insert_block(one, StateDiff::default())?;
 
         let two = create_dummy_block(blockchain.as_ref());
-        let two = blockchain.insert_block(two, StateDiff::default()).unwrap();
+        let two = blockchain.insert_block(two, StateDiff::default())?;
 
         assert_eq!(
             blockchain
-                .block_by_number(one.block.header().number)
-                .unwrap()
+                .block_by_number(one.block.header().number)?
                 .unwrap()
                 .hash(),
             one.block.hash()
         );
         assert_eq!(
-            blockchain
-                .block_by_number(two.block.header().number)
-                .unwrap()
-                .unwrap()
-                .hash(),
+            blockchain.block_by_hash(two.block.hash())?.unwrap().hash(),
             two.block.hash()
         );
     }
+
+    Ok(())
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -331,54 +330,48 @@ async fn insert_block_invalid_parent_hash() {
 
 #[tokio::test(flavor = "multi_thread")]
 #[serial]
-async fn revert_to_block() {
+async fn revert_to_block() -> anyhow::Result<()> {
     let blockchains = create_dummy_blockchains().await;
 
     for mut blockchain in blockchains {
-        let last_block = blockchain.last_block().unwrap();
+        let last_block = blockchain.last_block()?;
 
         let one = create_dummy_block(blockchain.as_ref());
-        let one = blockchain.insert_block(one, StateDiff::default()).unwrap();
+        let one = blockchain.insert_block(one, StateDiff::default())?;
 
         let two = create_dummy_block(blockchain.as_ref());
-        let two = blockchain.insert_block(two, StateDiff::default()).unwrap();
+        let two = blockchain.insert_block(two, StateDiff::default())?;
 
-        blockchain
-            .revert_to_block(last_block.header().number)
-            .unwrap();
+        blockchain.revert_to_block(last_block.header().number)?;
 
         // Last block still exists
-        assert_eq!(blockchain.last_block().unwrap().hash(), last_block.hash());
+        assert_eq!(blockchain.last_block()?.hash(), last_block.hash());
 
         assert_eq!(
-            blockchain
-                .block_by_hash(last_block.hash())
-                .unwrap()
-                .unwrap()
-                .hash(),
+            blockchain.block_by_hash(last_block.hash())?.unwrap().hash(),
             last_block.hash()
         );
 
         // Blocks 1 and 2 are gone
         assert!(blockchain
-            .block_by_number(one.block.header().number)
-            .unwrap()
+            .block_by_number(one.block.header().number)?
             .is_none());
 
         assert!(blockchain
-            .block_by_number(two.block.header().number)
-            .unwrap()
+            .block_by_number(two.block.header().number)?
             .is_none());
 
-        assert!(blockchain
-            .block_by_hash(one.block.hash())
-            .unwrap()
-            .is_none());
-        assert!(blockchain
-            .block_by_hash(two.block.hash())
-            .unwrap()
-            .is_none());
+        assert!(blockchain.block_by_hash(one.block.hash())?.is_none());
+        assert!(blockchain.block_by_hash(two.block.hash())?.is_none());
+
+        // Can insert a new block after reverting
+        let new = create_dummy_block(blockchain.as_ref());
+        let new = blockchain.insert_block(new.clone(), StateDiff::default())?;
+
+        assert_eq!(blockchain.last_block()?.hash(), new.block.hash());
     }
+
+    Ok(())
 }
 
 #[tokio::test]
@@ -392,11 +385,29 @@ async fn revert_to_block_invalid_number() {
             .revert_to_block(next_block_number)
             .expect_err("Should fail to insert block");
 
-        if let BlockchainError::UnknownBlockNumber = error {
-        } else {
-            panic!("Unexpected error: {error:?}");
-        }
+        assert!(matches!(error, BlockchainError::UnknownBlockNumber));
     }
+}
+
+#[cfg(feature = "test-remote")]
+#[tokio::test(flavor = "multi_thread")]
+#[serial]
+async fn revert_to_remote_block() -> anyhow::Result<()> {
+    use edr_evm::blockchain::ForkedBlockchainError;
+
+    let mut blockchain = create_forked_dummy_blockchain().await;
+
+    let last_block_number = blockchain.last_block_number();
+    let error = blockchain
+        .revert_to_block(last_block_number - 1)
+        .unwrap_err();
+
+    assert!(matches!(
+        error,
+        BlockchainError::Forked(ForkedBlockchainError::CannotDeleteRemote)
+    ));
+
+    Ok(())
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -492,6 +503,140 @@ async fn transaction_by_hash() {
 
         assert!(block.is_none());
     }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[serial]
+async fn transaction_by_hash_unknown() -> anyhow::Result<()> {
+    let blockchains = create_dummy_blockchains().await;
+
+    for blockchain in blockchains {
+        let transaction = create_dummy_transaction();
+
+        let block = blockchain.block_by_transaction_hash(transaction.hash())?;
+
+        assert!(block.is_none());
+    }
+
+    Ok(())
+}
+
+#[cfg(feature = "test-remote")]
+const REMOTE_BLOCK_NUMBER: u64 = 10_496_585;
+
+#[cfg(feature = "test-remote")]
+const REMOTE_BLOCK_HASH: &str =
+    "0x71d5e7c8ff9ea737034c16e333a75575a4a94d29482e0c2b88f0a6a8369c1812";
+
+#[cfg(feature = "test-remote")]
+const REMOTE_BLOCK_FIRST_TRANSACTION_HASH: &str =
+    "0xed0b0b132bd693ef34a72084f090df07c5c3a2ec019d76316da040d4222cdfb8";
+
+#[cfg(feature = "test-remote")]
+const REMOTE_BLOCK_LAST_TRANSACTION_HASH: &str =
+    "0xd809fb6f7060abc8de068c7a38e9b2b04530baf0cc4ce9a2420d59388be10ee7";
+
+#[cfg(feature = "test-remote")]
+#[tokio::test(flavor = "multi_thread")]
+#[serial]
+async fn remote_block_by_number() -> anyhow::Result<()> {
+    let blockchain = create_forked_dummy_blockchain().await;
+
+    let block = blockchain.block_by_number(REMOTE_BLOCK_NUMBER)?.unwrap();
+
+    let expected_hash = B256::from_str(REMOTE_BLOCK_HASH)?;
+    assert_eq!(*block.hash(), expected_hash);
+
+    let transactions = block.transactions();
+    assert_eq!(transactions.len(), 192);
+    assert_eq!(
+        *transactions[0].hash(),
+        B256::from_str(REMOTE_BLOCK_FIRST_TRANSACTION_HASH)?
+    );
+    assert_eq!(
+        *transactions[transactions.len() - 1].hash(),
+        B256::from_str(REMOTE_BLOCK_LAST_TRANSACTION_HASH)?
+    );
+
+    Ok(())
+}
+
+#[cfg(feature = "test-remote")]
+#[tokio::test(flavor = "multi_thread")]
+#[serial]
+async fn remote_block_by_hash() -> anyhow::Result<()> {
+    let blockchain = create_forked_dummy_blockchain().await;
+
+    let block = blockchain
+        .block_by_hash(&B256::from_str(REMOTE_BLOCK_HASH)?)?
+        .unwrap();
+
+    assert_eq!(block.header().number, REMOTE_BLOCK_NUMBER);
+
+    let transactions = block.transactions();
+    assert_eq!(transactions.len(), 192);
+    assert_eq!(
+        *transactions[0].hash(),
+        B256::from_str(REMOTE_BLOCK_FIRST_TRANSACTION_HASH)?
+    );
+    assert_eq!(
+        *transactions[transactions.len() - 1].hash(),
+        B256::from_str(REMOTE_BLOCK_LAST_TRANSACTION_HASH)?
+    );
+
+    Ok(())
+}
+
+#[cfg(feature = "test-remote")]
+#[tokio::test(flavor = "multi_thread")]
+#[serial]
+async fn remote_block_caches() -> anyhow::Result<()> {
+    use std::sync::Arc;
+
+    let blockchain = create_forked_dummy_blockchain().await;
+
+    let block1 = blockchain.block_by_number(REMOTE_BLOCK_NUMBER)?.unwrap();
+    let block2 = blockchain
+        .block_by_hash(&B256::from_str(REMOTE_BLOCK_HASH)?)?
+        .unwrap();
+    let block3 = blockchain.block_by_number(REMOTE_BLOCK_NUMBER)?.unwrap();
+    let block4 = blockchain
+        .block_by_hash(&B256::from_str(REMOTE_BLOCK_HASH)?)?
+        .unwrap();
+
+    assert!(Arc::ptr_eq(&block1, &block2));
+    assert!(Arc::ptr_eq(&block2, &block3));
+    assert!(Arc::ptr_eq(&block3, &block4));
+
+    Ok(())
+}
+
+#[cfg(feature = "test-remote")]
+#[tokio::test(flavor = "multi_thread")]
+#[serial]
+async fn remote_block_with_create() -> anyhow::Result<()> {
+    const DAI_CREATION_BLOCK_NUMBER: u64 = 4_719_568;
+    const DAI_CREATION_TRANSACTION_INDEX: usize = 85;
+    const DAI_CREATION_TRANSACTION_HASH: &str =
+        "0xb95343413e459a0f97461812111254163ae53467855c0d73e0f1e7c5b8442fa3";
+
+    let blockchain = create_forked_dummy_blockchain().await;
+
+    let block = blockchain
+        .block_by_number(DAI_CREATION_BLOCK_NUMBER)?
+        .unwrap();
+    let transactions = block.transactions();
+
+    assert_eq!(
+        *transactions[DAI_CREATION_TRANSACTION_INDEX].hash(),
+        B256::from_str(DAI_CREATION_TRANSACTION_HASH)?
+    );
+    assert!(matches!(
+        transactions[DAI_CREATION_TRANSACTION_INDEX].kind(),
+        TransactionKind::Create
+    ));
+
+    Ok(())
 }
 
 #[cfg(feature = "test-remote")]
